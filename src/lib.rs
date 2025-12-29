@@ -222,7 +222,7 @@ impl<I: AsyncI2c + AsyncErrorType> AsyncTMP468<I> {
             .write_read(self.address, &[reg], &mut buf)
             .await
             .map_err(Error::I2c)?;
-        debug!("R @0x{:x}={:x?}", reg, buf);
+        info!("R @0x{:x}={:x?}", reg, buf);
         Ok(u16::from_be_bytes(buf))
     }
 
@@ -230,7 +230,7 @@ impl<I: AsyncI2c + AsyncErrorType> AsyncTMP468<I> {
     async fn write_reg<REG: Into<u8>>(&mut self, reg: REG, value: u16) -> Result<(), I::Error> {
         trace!("write_reg");
         let reg = reg.into();
-        debug!("W @0x{:x}={:x}", reg, value);
+        info!("W @0x{:x}={:x}", reg, value);
         self.i2c
             .write(
                 self.address,
@@ -347,6 +347,69 @@ impl<I: AsyncI2c + AsyncErrorType> AsyncTMP468<I> {
 
         Ok(factor)
     }
+    pub async fn set_temp_offset(&mut self, channel: u8, offset_c: f32) -> Result<(), I::Error> {
+        trace!("calibrate_remote_temp");
+        if !(1..=8).contains(&channel) {
+            return Err(Error::InvalidValue);
+        }
+        let reg_offset = Register::RemoteTemp1Offset as u8 + (channel - 1) * 8;
+
+        if offset_c < -128.0 || offset_c > 127.9375 {
+            error!("Offset out of range");
+            return Err(Error::InvalidValue);
+        }
+
+        // Convert °C to register steps (0.0625 °C per LSB)
+        let mut raw = (offset_c / 0.0625).round() as i16;
+
+        // Ensure proper two's complement for 12 bits
+        if raw < -2048 || raw > 2047 {
+            error!("Offset out of 12-bit range");
+            return Err(Error::InvalidValue);
+        }
+        // info!("Raw offset value: {}", raw);
+        // info!("Binary representation: {:b}", raw);
+        // if raw < 0 {
+        //     raw = (1 << 12) + raw; // two's complement
+        // }
+        // info!("Two's complement raw value: {}", raw);
+        //
+        // // Align to upper 12 bits (lower 3 bits always zero)
+        // let reg_value: u16 = (raw as u16) << 3;
+        // info!("Register value to write: 0x{:04X}", reg_value);
+        //
+        let reg_value: u16 = (raw << 3) as u16;
+        info!("Register value to write: 0x{:04X}", reg_value);
+        info!(
+            "set_temp_offset: channel={}, offset_c={}",
+            channel, offset_c
+        );
+        self.write_reg(reg_offset, reg_value)
+            .await
+            .map_err(Error::I2c);
+        Ok(())
+    }
+    pub async fn read_temp_offset(&mut self, channel: u8) -> Result<f32, I::Error> {
+        trace!("read_n_factor");
+        if !(1..=8).contains(&channel) {
+            return Err(Error::InvalidValue);
+        }
+        let reg_offset = Register::RemoteTemp1Offset as u8 + (channel - 1) * 8;
+        let resp = self.read_reg(reg_offset).await.map_err(Error::I2c).unwrap();
+        // Extract the 12-bit signed value (upper 12 bits)
+        let raw = (resp >> 3);
+        let offset = if raw & 0x800 != 0 {
+            // Negative value in two's complement
+            -(((!raw & 0xFFF) + 1) as f32 * 0.0625)
+        } else {
+            // Positive value
+            (raw as f32) * 0.0625
+        };
+        debug!("read_temp_offset: channel={}, offset_c={}", channel, offset);
+
+        Ok(offset)
+    }
+
     pub async fn set_lock(&mut self, locked: bool) -> Result<(), I::Error> {
         let value = if locked { 0x5CA6 } else { 0xEB19 };
         self.write_reg(Register::LockRegister, value)
